@@ -4,6 +4,13 @@ import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
 
+function validSignal(data){
+  if(!data || typeof data!=='object')return false;
+  if(data.description)return ['offer','answer'].includes(data.description.type) && typeof data.description.sdp==='string' && data.description.sdp.length<=60000;
+  const c=data.candidate;
+  return !!c && typeof c.candidate==='string' && c.candidate.length<=4096 && (c.sdpMid==null || typeof c.sdpMid==='string') && (c.sdpMLineIndex==null || Number.isInteger(c.sdpMLineIndex));
+}
+
 export function createApp({iceServers = [], origin = '', maxConnections = 200} = {}) {
   const rooms = new Map();
   const files = {'/':['index.html','text/html'], '/app.js':['app.js','text/javascript'], '/style.css':['style.css','text/css']};
@@ -14,10 +21,10 @@ export function createApp({iceServers = [], origin = '', maxConnections = 200} =
     res.setHeader('Permissions-Policy','camera=(), microphone=(self), display-capture=(self)');
     res.setHeader('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; media-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'");
     if(req.method !== 'GET') {res.writeHead(405).end();return;}
-    const path = new URL(req.url,'http://localhost').pathname;
+    let path;try{path=new URL(req.url,'http://localhost').pathname;}catch{res.writeHead(400).end();return;}
     if(path === '/health') {res.writeHead(200,{'Content-Type':'application/json'}).end('{"ok":true}'); return;}
     if(path === '/config') {res.writeHead(200,{'Content-Type':'application/json'}).end(JSON.stringify({iceServers})); return;}
-    if(!files[path]) {res.writeHead(404).end();return;}
+    if(!Object.hasOwn(files,path)) {res.writeHead(404).end();return;}
     try {res.writeHead(200,{'Content-Type':files[path][1]}); res.end(await readFile(new URL('./public/'+files[path][0],import.meta.url)));}
     catch {res.end();}
   });
@@ -27,7 +34,11 @@ export function createApp({iceServers = [], origin = '', maxConnections = 200} =
     if(req.url !== '/ws' || req.headers.origin !== expected || wss.clients.size >= maxConnections) {socket.end('HTTP/1.1 403 Forbidden\r\n\r\n');return;}
     wss.handleUpgrade(req,socket,head,ws=>wss.emit('connection',ws));
   });
-  const send = (ws,data) => {if(ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify(data));};
+  const send = (ws,data) => {
+    if(ws.readyState!==WebSocket.OPEN)return;
+    if(ws.bufferedAmount>1024*1024){ws.terminate();return;}
+    ws.send(JSON.stringify(data));
+  };
   const roster = room => {for(const p of room.values()) send(p.ws,{type:'roster',members:[...room.values()].map(({id,name,muted})=>({id,name,muted})),presenter:room.presenter||null});};
   wss.on('connection', ws => {
     let member, room, key, count=0, since=Date.now();
@@ -48,7 +59,7 @@ export function createApp({iceServers = [], origin = '', maxConnections = 200} =
         send(ws,{type:'joined',id:member.id,peers});roster(room);return;
       }
       if(!member)return;
-      if(m.type==='signal' && typeof m.to==='string' && room.has(m.to)) send(room.get(m.to).ws,{type:'signal',from:member.id,data:m.data});
+      if(m.type==='signal' && typeof m.to==='string' && m.to!==member.id && room.has(m.to) && validSignal(m.data)) send(room.get(m.to).ws,{type:'signal',from:member.id,data:m.data});
       if(m.type==='mute' && typeof m.muted==='boolean'){member.muted=m.muted;roster(room);}
       if(m.type==='share-start'){
         if(room.presenter && room.presenter!==member.id)send(ws,{type:'share-denied'});

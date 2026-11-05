@@ -72,6 +72,39 @@ npm run test:browser
 
 공식 참고: [WebRTC TURN 안내](https://webrtc.org/getting-started/turn-server), [MDN 화면 캡처 권한/HTTPS 요구사항](https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getDisplayMedia).
 
-### 이 작업 환경에서의 검증 한계
+### 실제 미디어 검증 결과 (2026-11-05)
 
-관리형 Chromium의 `WebRtcIPHandling=disable_non_proxied_udp` 정책으로 직접 ICE 후보가 생성되지 않아 실제 미디어 전송 테스트는 차단되었습니다. 정책은 변경하지 않았습니다. `SKIP_MEDIA_TESTS=1 npm run test:browser`는 미디어 전송 검증을 명시적으로 건너뛰고 연결 협상 및 UI 흐름만 검사합니다. 이 모드 통과는 음성/화면 전송 성공을 의미하지 않습니다. 제한 없는 테스트 기기에서 기본 `npm run test:browser`와 실제 사람 간 통화를 반드시 확인해야 합니다.
+관리형 Chromium의 `WebRtcIPHandling=disable_non_proxied_udp` 정책 때문에 직접 연결 테스트는 불가능했으나, **localhost에만 바인딩한 coturn의 TURN-over-TCP**로 실제 미디어 테스트가 통과했습니다. 브라우저 정책, 네트워크 정책, 운영체제 권한을 변경하지 않았고 외부 배포도 하지 않았습니다.
+
+- 실제 WebRTC 연결, 음성 RTP 수신 및 0보다 큰 수신 오디오 에너지 확인. 최종 테스트 관측: 음성 8,498 bytes, `totalAudioEnergy=0.39230524636276143`.
+- canvas로 만든 화면 스트림의 RTP 수신 및 10개 이상의 프레임 디코딩 확인. 최종 테스트 관측: 화면 22,453 bytes, 10 decoded frames. 카운터는 실행마다 달라집니다.
+- 선택된 로컬 ICE 후보가 `relay`, TURN 전송이 `tcp`인지 확인.
+- 화면 공유 중지/재시작, 공유 중 세 번째 탭 입장과 화면 수신, 퇴장 정리 확인.
+- 화면 선택 대기 중 참가자 상태 변경에도 중복 캡처를 막고, 선택 대기 중 퇴장하면 나중에 반환된 캡처 트랙을 종료하는 회귀 테스트 통과.
+
+재현: coturn을 설치한 Linux 테스트 장비의 터미널 하나에서 아래를 실행합니다. 이 설정은 **로컬 테스트 전용**으로 인터넷 운영에 사용하면 안 됩니다. 테스트 후 Control+C로 중지합니다.
+
+```sh
+turnserver -n --listening-ip=127.0.0.1 --relay-ip=127.0.0.1 \
+  --listening-port=34789 --min-port=50000 --max-port=50100 \
+  --no-udp --no-tls --no-dtls --no-cli --allow-loopback-peers \
+  --lt-cred-mech --user=localtest:localtest --realm=zoomiliar-local \
+  --pidfile=/tmp/zoomiliar-turn.pid --log-file=/tmp/zoomiliar-turn.log \
+  --relay-threads=1
+```
+
+다른 터미널에서:
+
+```sh
+TEST_ICE_SERVERS_JSON='[{"urls":"turn:127.0.0.1:34789?transport=tcp","username":"localtest","credential":"localtest"}]' npm run test:browser
+```
+
+실제 사람이 말하는 마이크와 OS 화면 선택기는 여전히 자동화 테스트 장치/canvas로 대체합니다. 따라서 실제 사람 간 음질, OS 화면 권한, 다른 인터넷 회선/NAT, 10명 미디어 부하, 몇 시간 지속성은 검증하지 않았습니다. 로컬 TURN 성공이 이 조건들의 안정성을 보장하지 않습니다.
+
+TURN 없는 제한된 환경에서는 `SKIP_MEDIA_TESTS=1 npm run test:browser`로 UI/연결 협상만 검사할 수 있습니다. 이 모드의 성공은 미디어 전송 성공을 의미하지 않습니다.
+
+### 소규모 비공개 모임 관련 점검
+
+화면 캡처/중지 작업을 직렬화하고 실패 시 캡처를 정리합니다. 신호 메시지의 형식을 검사하고 자기 자신으로 보내는 신호를 거부합니다. 미처리 ICE 후보는 100개, 느린 연결의 서버 송신 대기열은 약 1 MiB로 제한해 무한 증가를 방지합니다. 참가자 이름은 HTML로 삽입하지 않고 텍스트로만 표시합니다.
+
+초대 링크는 여전히 입장 권한 자체입니다. 악의적인 참가자의 자체 녹화, 수정한 클라이언트로 보내는 음성, 신호 남용까지 완전히 막는 서비스가 아닙니다. 신뢰하는 소규모 참가자에게만 링크를 전달하세요. 자동 재연결, 호스트 승인/퇴장, 만료되는 초대, 운영용 TURN 임시 자격 증명 발급은 후속 작업입니다.

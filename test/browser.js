@@ -2,10 +2,21 @@ import { chromium } from 'playwright';
 import assert from 'node:assert/strict';
 import { mkdir } from 'node:fs/promises';
 import { createApp } from '../server.js';
-const app=createApp();await new Promise(r=>app.server.listen(0,'127.0.0.1',r));
+const iceServers=JSON.parse(process.env.TEST_ICE_SERVERS_JSON||'[]');
+const app=createApp({iceServers});await new Promise(r=>app.server.listen(0,'127.0.0.1',r));
 const url=`http://127.0.0.1:${app.server.address().port}`;
 const browser=await chromium.launch({executablePath:process.env.CHROMIUM_PATH||'/usr/bin/chromium',headless:true,args:['--no-sandbox','--use-fake-ui-for-media-stream','--use-fake-device-for-media-stream','--autoplay-policy=no-user-gesture-required']});
 const errors=[];
+async function waitMedia(page,kind){
+  const deadline=Date.now()+15000;
+  while(Date.now()<deadline){
+    const ok=await page.evaluate(async kind=>{const stats=await window.testPCs[0].getStats();return [...stats.values()].some(s=>s.type==='inbound-rtp'&&s.kind===kind&&(kind==='audio'?s.bytesReceived>0&&s.totalAudioEnergy>0:s.framesDecoded>=10));},kind);
+    if(ok)return;
+    await new Promise(r=>setTimeout(r,150));
+  }
+  throw Error('No verified media received: '+kind);
+}
+
 try{
   const context=await browser.newContext({permissions:['microphone','clipboard-write'],viewport:{width:1440,height:1000}});
   context.setDefaultTimeout(10000);
@@ -21,11 +32,17 @@ try{
   for(const page of [a,b])assert.equal(await page.evaluate(()=>window.testPCs[0].getTransceivers().find(t=>t.receiver.track.kind==='video').currentDirection),'sendrecv');
   if(!skipMedia)for(const page of [a,b])await page.waitForFunction(()=>window.testPCs.some(p=>p.connectionState==='connected'));
   await a.locator('#mute').click();await b.waitForFunction(()=>document.querySelector('#members').textContent.includes('마이크 켜짐'));
-  if(!skipMedia)await b.waitForFunction(async()=>{const s=await window.testPCs[0].getStats();return [...s.values()].some(x=>x.type==='inbound-rtp'&&x.kind==='audio'&&x.bytesReceived>0);});
+  if(!skipMedia)await waitMedia(b,'audio');
   // Synthetic canvas replaces only the OS picker. Captured video goes over real WebRTC.
   await a.evaluate(()=>{navigator.mediaDevices.getDisplayMedia=async()=>{const c=document.createElement('canvas');c.width=640;c.height=360;const ctx=c.getContext('2d');window.paintTimer=setInterval(()=>{ctx.fillStyle='#698b59';ctx.fillRect(0,0,640,360);ctx.fillStyle='white';ctx.font='30px sans-serif';ctx.fillText('Screen sharing '+Date.now(),20,120);},100);return c.captureStream(10);};});
   await a.locator('#share').click();await b.locator('#screen').waitFor({state:'visible'});if(!skipMedia)await b.waitForFunction(()=>document.querySelector('#screen').videoWidth>0);
-  if(!skipMedia)await b.waitForFunction(async()=>{const s=await window.testPCs[0].getStats();return [...s.values()].some(x=>x.type==='inbound-rtp'&&x.kind==='video'&&x.framesDecoded>0);});
+  if(!skipMedia)await waitMedia(b,'video');
+  if(!skipMedia){
+    const evidence=await b.evaluate(async()=>{const stats=await window.testPCs[0].getStats();const all=[...stats.values()];const transport=all.find(s=>s.type==='transport'&&s.selectedCandidatePairId);const pair=stats.get(transport.selectedCandidatePairId);return {audio:all.filter(s=>s.type==='inbound-rtp'&&s.kind==='audio').map(s=>({bytesReceived:s.bytesReceived,totalAudioEnergy:s.totalAudioEnergy})),video:all.filter(s=>s.type==='inbound-rtp'&&s.kind==='video').map(s=>({bytesReceived:s.bytesReceived,framesDecoded:s.framesDecoded})),localCandidateType:stats.get(pair.localCandidateId).candidateType,relayProtocol:stats.get(pair.localCandidateId).relayProtocol};});
+    assert.ok(evidence.video.some(s=>s.framesDecoded>=10));assert.ok(evidence.audio.some(s=>s.totalAudioEnergy>0));
+    if(iceServers.length){assert.equal(evidence.localCandidateType,'relay');assert.equal(evidence.relayProtocol,'tcp');}
+    console.log('MEDIA EVIDENCE',JSON.stringify(evidence));
+  }
   assert.equal(await b.locator('#share').isDisabled(),true);
   await b.screenshot({path:'test-results/call-screen.png',fullPage:true});
   await a.locator('#share').click();await b.locator('#screen').waitFor({state:'hidden'});
@@ -36,6 +53,14 @@ try{
   await b.locator('#leave').click();await c.locator('#leave').click();
   // Permission denial leaves the form usable.
   await b.evaluate(()=>navigator.mediaDevices.getUserMedia=async()=>{throw new DOMException('Denied','NotAllowedError');});await b.locator('#join').click();await b.waitForFunction(()=>document.querySelector('#status').textContent.includes('허용'));assert.equal(await b.locator('#join').isEnabled(),true);
+  // Roster updates must not reopen the button while an OS screen picker is pending.
+  await a.locator('#join').click();await a.locator('#call').waitFor({state:'visible'});
+  await a.evaluate(()=>{navigator.mediaDevices.getDisplayMedia=()=>new Promise(resolve=>{window.resolvePicker=()=>{const c=document.createElement('canvas');window.pendingCapture=c.captureStream();resolve(window.pendingCapture);};});});
+  await a.locator('#share').click();await a.locator('#mute').click();
+  await a.waitForFunction(()=>document.querySelector('#members').textContent.includes('마이크 켜짐'));
+  assert.equal(await a.locator('#share').isDisabled(),true);
+  await a.locator('#leave').click();await a.evaluate(()=>window.resolvePicker());
+  await a.waitForFunction(()=>window.pendingCapture.getTracks().every(t=>t.readyState==='ended'));
   await a.setViewportSize({width:390,height:844});await a.screenshot({path:'test-results/mobile.png',fullPage:true});
   assert.deepEqual(errors,[]);console.log('PASS: signaling; mute; screen lifecycle; late join; leave cleanup; permission denial; desktop/mobile screenshots.');console.log(skipMedia?'SKIPPED: media transport and decoded frames (managed WebRTC policy).':'PASS: real audio RTP and screen RTP/decoded frames.');
 }finally{await browser.close();await app.close();}
