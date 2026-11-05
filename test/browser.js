@@ -18,6 +18,7 @@ try{
   await b.goto(a.url());await b.locator('#name').fill('바다');await b.locator('#join').click();await b.locator('#call').waitFor({state:'visible'});
   const skipMedia=process.env.SKIP_MEDIA_TESTS==='1';
   for(const page of [a,b])await page.waitForFunction(()=>window.testPCs.some(p=>p.signalingState==='stable'&&p.localDescription&&p.remoteDescription));
+  for(const page of [a,b])assert.equal(await page.evaluate(()=>window.testPCs[0].getTransceivers().find(t=>t.receiver.track.kind==='video').currentDirection),'sendrecv');
   if(!skipMedia)for(const page of [a,b])await page.waitForFunction(()=>window.testPCs.some(p=>p.connectionState==='connected'));
   await a.locator('#mute').click();await b.waitForFunction(()=>document.querySelector('#members').textContent.includes('마이크 켜짐'));
   if(!skipMedia)await b.waitForFunction(async()=>{const s=await window.testPCs[0].getStats();return [...s.values()].some(x=>x.type==='inbound-rtp'&&x.kind==='audio'&&x.bytesReceived>0);});

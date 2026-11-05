@@ -27,7 +27,7 @@ function render(){
 async function makePeer(id, initiator){
   if(peers.has(id))return peers.get(id);
   const pc=new RTCPeerConnection(config);
-  const p={pc,queue:Promise.resolve(),audio:document.createElement('audio'),video:null};peers.set(id,p);
+  const p={pc,queue:Promise.resolve(),audio:document.createElement('audio'),video:null,candidates:[]};peers.set(id,p);
   p.audio.autoplay=true;document.body.append(p.audio);
   pc.addTrack(mic.getAudioTracks()[0],mic);
   // Reserve a video sender once: starting/stopping sharing needs no renegotiation.
@@ -38,8 +38,10 @@ async function makePeer(id, initiator){
     if(e.track.kind==='audio'){p.audio.srcObject=new MediaStream([e.track]);p.audio.play().catch(()=>$('sound').hidden=false);}
     else{p.video=e.track;render();}
   };
+  p.connectTimer=setTimeout(()=>{if(peers.has(id) && pc.connectionState!=='connected')status('연결이 지연되고 있습니다. 서로 다른 네트워크라면 운영자의 TURN 설정을 확인해주세요.');},20000);
   pc.onconnectionstatechange=()=>{
     render();
+    if(pc.connectionState==='connected')clearTimeout(p.connectTimer);
     if(pc.connectionState==='failed')status('참가자 연결에 실패했습니다. 다시 입장하거나 운영자에게 TURN 설정을 요청하세요.');
   };
   if(initiator){await pc.setLocalDescription(await pc.createOffer());send({type:'signal',to:id,data:{description:pc.localDescription}});}
@@ -48,12 +50,12 @@ async function makePeer(id, initiator){
 async function signal(m){
   let p=peers.get(m.from);if(!p)p=await makePeer(m.from,false);
   p.queue=p.queue.then(async()=>{
-    if(m.data?.description){await p.pc.setRemoteDescription(m.data.description);if(m.data.description.type==='offer'){const video=p.pc.getTransceivers().find(t=>t.receiver.track.kind==='video');video.direction='sendrecv';p.sender=video.sender;if(screenStream && !pendingShare)await p.sender.replaceTrack(screenStream.getVideoTracks()[0]);await p.pc.setLocalDescription(await p.pc.createAnswer());send({type:'signal',to:m.from,data:{description:p.pc.localDescription}});}}
-    else if(m.data?.candidate)await p.pc.addIceCandidate(m.data.candidate);
+    if(m.data?.description){await p.pc.setRemoteDescription(m.data.description);for(const candidate of p.candidates)await p.pc.addIceCandidate(candidate);p.candidates=[];if(m.data.description.type==='offer'){const video=p.pc.getTransceivers().find(t=>t.receiver.track.kind==='video');video.direction='sendrecv';p.sender=video.sender;if(screenStream && !pendingShare)await p.sender.replaceTrack(screenStream.getVideoTracks()[0]);await p.pc.setLocalDescription(await p.pc.createAnswer());send({type:'signal',to:m.from,data:{description:p.pc.localDescription}});}}
+    else if(m.data?.candidate){if(p.pc.remoteDescription)await p.pc.addIceCandidate(m.data.candidate);else p.candidates.push(m.data.candidate);}
   }).catch(()=>status('연결 협상에 실패했습니다. 나갔다가 다시 입장해주세요.'));
   await p.queue;
 }
-function dropPeer(id){const p=peers.get(id);if(p){p.pc.close();p.audio.remove();peers.delete(id);}}
+function dropPeer(id){const p=peers.get(id);if(p){clearTimeout(p.connectTimer);p.pc.close();p.audio.remove();peers.delete(id);}}
 async function stopShare(){
   pendingShare=false;
   const old=screenStream;screenStream=null;
